@@ -1,0 +1,937 @@
+OK forget above I attached here a complete code we ran and got this result I think right now the model can classify the binary occupancy
+```config.py
+# src/config.py
+
+# --- Foundational Paths ---
+SYNTHETIC_DATA_PATH = "data/synthetic"
+REAL_DATA_PATH = "data/real"
+# Use a new, descriptive name for this experiment's processed data
+PROCESSED_DATA_DIR = "processed_data_binary_s2r" 
+ARTIFACTS_DIR = "artifacts_binary_s2r"
+
+# --- Model Paths ---
+FINETUNED_MODEL_PATH = f"{ARTIFACTS_DIR}/clip_finetuned_sim2real"
+
+# --- CLIP and Model Configuration ---
+CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
+
+# --- Class Mappings and Text Prompts for the BINARY task ---
+CLASS_MAPPING = {
+    "empty_room": 0, 
+    "1_person": 1,
+}
+
+TEXT_DESCRIPTORS = {
+    0: "A radar heatmap of an empty room with only static background and sensor noise.",
+    1: "A radar heatmap showing the distinct micro-doppler signature of a single person walking."
+}
+
+CLASS_NAMES = list(CLASS_MAPPING.keys())
+
+# --- Hyperparameters ---
+FINETUNE_EPOCHS = 50
+FINETUNE_BATCH_SIZE = 32
+FINETUNE_LR = 5e-6
+EARLY_STOPPING_PATIENCE = 10
+WEIGHT_DECAY = 0.01
+EVAL_BATCH_SIZE = 64
+```
+
+```dataset.py
+# src/dataset.py
+
+import torch
+from torch.utils.data import Dataset
+import h5py
+import json
+import numpy as np
+from PIL import Image
+from torchvision import transforms
+from .radar_utils import preprocess_frame # Import from the new utility file
+from matplotlib import cm
+
+# class RadarFrameDatasetOld(Dataset):
+
+# def __init__(self, h5_path, stats_path, processor, is_train=False,):
+
+# self.h5_path = h5_path
+
+# self.processor = processor
+
+# self.is_train = is_train
+
+# self.data_file = h5py.File(self.h5_path, 'r')
+
+# self.rdm_frames = self.data_file['data']
+
+# self.labels = self.data_file['labels']
+
+
+
+# with open(stats_path, 'r') as f:
+
+# stats = json.load(f)
+
+# self.min_val, self.max_val = stats['min'], stats['max']
+
+
+
+# if self.is_train:
+
+# self.augmentation_transform = transforms.Compose([
+
+# transforms.RandomHorizontalFlip(p=0.5),
+
+# transforms.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+
+# transforms.ColorJitter(brightness=0.2, contrast=0.2),
+
+# ])
+
+
+
+# def __len__(self):
+
+# return len(self.labels)
+
+
+
+# def __getitem__(self, idx):
+
+# db_frame = self.rdm_frames[idx]
+
+# label = self.labels[idx]
+
+
+
+# # Use the shared utility function to create the base PIL Image
+
+# # image = preprocess_frame(db_frame, self.min_val, self.max_val, f"train_seen/{idx}.png")
+
+# image = preprocess_frame(db_frame, self.min_val, self.max_val, f"test_seen/{idx}.png")
+
+# # image = preprocess_frame(db_frame, self.min_val, self.max_val, f"test_r1_seen/{idx}.png")
+
+
+
+# if self.is_train:
+
+# image = self.augmentation_transform(image)
+
+# processed = self.processor(images=image, return_tensors="pt", padding=True)
+
+
+# return {
+
+# 'pixel_values': processed['pixel_values'].squeeze(0),
+
+# 'label': torch.tensor(label, dtype=torch.long)
+
+# }
+
+
+
+
+
+# --- RadarFrameDataset (from your previous code) ---
+class RadarFrameDataset(Dataset):
+    """
+    Loads pre-processed RD heatmaps and prepares them for a model.
+    It now accepts a transform pipeline for data augmentation.
+    """
+
+    def __init__(self, h5_path, stats_path, processor=None, transform=None):
+
+        self.h5_path = h5_path
+        self.processor = processor
+        self.transform = transform
+
+        with open(stats_path, 'r') as f:
+            stats = json.load(f)
+            self.min_val, self.max_val = stats['min'], stats['max']
+            self.cmap = cm.get_cmap('viridis')
+
+        with h5py.File(self.h5_path, 'r') as hf:    
+            self.length = len(hf['labels'])
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        with h5py.File(self.h5_path, 'r') as hf:
+            rd_map = hf['data'][idx]
+            label = hf['labels'][idx]
+
+        # --- Standard Preprocessing ---
+        rd_map_clipped = np.clip(rd_map, self.min_val, self.max_val)
+        denominator = self.max_val - self.min_val
+        if denominator < 1e-6: denominator = 1e-6
+        rd_map_normalized = (rd_map_clipped - self.min_val) / denominator
+        colored_map = self.cmap(rd_map_normalized)
+        rgb_image_array = (colored_map[:, :, :3] * 255).astype(np.uint8)
+        image = Image.fromarray(rgb_image_array)
+
+        # --- Apply Transforms ---
+        # The CLIP processor handles basic transforms like resize and normalize.
+        # The custom augmentation transform pipeline is applied after.
+        if self.processor:
+            processed = self.processor(images=image, return_tensors="pt")
+            pixel_values = processed['pixel_values'].squeeze(0)
+        else:
+            pixel_values = transforms.ToTensor()(image) # Fallback if no processor
+
+        if self.transform:
+            pixel_values = self.transform(pixel_values)
+        
+        return {"pixel_values": pixel_values, "label": torch.tensor(label, dtype=torch.long)}
+```
+
+```finetune_clip.py
+# src/finetune_clip.py
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from transformers import CLIPModel, CLIPProcessor
+from tqdm import tqdm
+import os
+from . import config, dataset
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+def main():
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
+    print(f"Loading CLIP model: {config.CLIP_MODEL_NAME}")
+
+    model = CLIPModel.from_pretrained(config.CLIP_MODEL_NAME).to(device)
+    processor = CLIPProcessor.from_pretrained(config.CLIP_MODEL_NAME)
+
+
+    # --- Prepare Data ---
+    train_full_h5_path = os.path.join(config.PROCESSED_DATA_DIR, 'train_frames.h5') # Using train split for training
+    val_full_h5_path = os.path.join(config.PROCESSED_DATA_DIR, 'val_frames.h5') # Using val split for validation
+    stats_path = os.path.join(config.PROCESSED_DATA_DIR, "norm_stats.json")
+
+
+
+    # The full dataset is loaded here
+    train_dataset = dataset.RadarFrameDataset(train_full_h5_path, stats_path, processor)
+    val_dataset = dataset.RadarFrameDataset(val_full_h5_path, stats_path, processor)
+
+
+
+    # Split into training and validation sets
+    # val_size = int(0.2 * len(full_dataset))
+
+    # train_size = len(full_dataset) - val_size
+
+    # train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+
+
+    print(f"Total training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+
+    train_loader = DataLoader(train_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=config.FINETUNE_BATCH_SIZE, shuffle=False, num_workers=4)
+
+    text_prompts = [config.TEXT_DESCRIPTORS[i] for i in range(len(config.CLASS_NAMES))]
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.FINETUNE_LR)
+
+
+
+    # --- Early Stopping and Validation Logic ---
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
+    print(f"Starting CLIP fine-tuning for {config.FINETUNE_EPOCHS} epochs...")
+
+    for epoch in range(config.FINETUNE_EPOCHS):
+        model.train()
+        total_loss = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.FINETUNE_EPOCHS}"):
+            pixel_values = batch['pixel_values'].to(device)
+            ground_truth = batch['label'].to(device)
+            text_inputs = processor(text=text_prompts, return_tensors="pt", padding=True).to(device)
+            outputs = model(pixel_values=pixel_values, **text_inputs)
+            logits_per_image = outputs.logits_per_image
+            loss = nn.functional.cross_entropy(logits_per_image, ground_truth)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        avg_train_loss = total_loss / len(train_loader)
+
+
+
+        # --- Validation Loop ---
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config.FINETUNE_EPOCHS} [Validation]"):
+                pixel_values = batch['pixel_values'].to(device)
+                ground_truth = batch['label'].to(device)
+                text_inputs = processor(text=text_prompts, return_tensors="pt", padding=True).to(device)
+                outputs = model(pixel_values=pixel_values, **text_inputs)
+                loss = nn.functional.cross_entropy(outputs.logits_per_image, ground_truth)
+                total_val_loss += loss.item()
+        avg_val_loss = total_val_loss / len(val_loader)
+        print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+
+
+
+        # --- Early Stopping Check ---
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            model.save_pretrained(config.FINETUNED_MODEL_PATH)
+            processor.save_pretrained(config.FINETUNED_MODEL_PATH)
+            print(f"Validation loss improved. Saved new best model.")
+        else:
+            patience_counter += 1
+            print(f"INFO: No improvement in validation loss for {patience_counter} epoch(s).")
+
+
+        if patience_counter >= config.EARLY_STOPPING_PATIENCE:
+            print(f"🛑 Early stopping triggered after {patience_counter} epochs.")
+            break
+
+    model.save_pretrained(config.FINETUNED_MODEL_PATH)
+    processor.save_pretrained(config.FINETUNED_MODEL_PATH)
+    print(f"✅ Fine-tuned CLIP model saved to {config.FINETUNED_MODEL_PATH}")
+
+if __name__ == '__main__':
+
+    main()
+```
+
+```radar_utils.py
+# src/radar_utils.py
+import numpy as np
+from PIL import Image
+from matplotlib import cm
+import matplotlib.pyplot as plt
+import os
+
+def preprocess_frame(db_frame, min_val, max_val, output_path=None):
+    """
+    Normalizes a dB-scaled frame and converts it to a colormapped PIL Image.
+    """
+
+    # normalized_frame = (db_frame - min_val) / (max_val - min_val)
+    # normalized_frame = np.clip(normalized_frame, 0, 1)
+    rd_map_clipped = np.clip(db_frame, min_val, max_val)
+    denominator = max_val - min_val
+    if denominator < 1e-6: # Use a small epsilon for floating point safety
+        denominator = 1e-6 
+    rd_map_normalized = (rd_map_clipped - min_val) / denominator
+
+
+    # Apply colormap and convert to PIL Image
+    colormap = cm.get_cmap('viridis')
+    rgb_frame = colormap(rd_map_normalized)[:, :, :3]
+    image = Image.fromarray((rgb_frame * 255).astype(np.uint8))
+    # output_path="/home/huy/seb_paper/clip_sim2real/zero_shot_sim_to_real/train_seen"
+    # --- NEW: Save the image if an output path is provided ---
+    if output_path:
+        # print(f"Saving debug image to {output_path}...")
+        try:
+            # Ensure the parent directory exists
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            # Save the PIL Image
+            image.save(output_path)
+        except Exception as e:
+            # Add a warning if saving fails for any reason
+            print(f"Warning: Could not save debug image to {output_path}. Error: {e}")
+
+    return image
+```
+
+```evaluate.py
+# src/evaluate.py
+
+import torch
+from torch.utils.data import DataLoader
+from transformers import CLIPModel, CLIPProcessor
+from tqdm import tqdm
+import os
+from . import config, dataset, utils
+
+def run_zero_shot_eval(model, processor, test_loader, device):
+
+    # ... (This function does not need changes)
+    model.to(device)
+    model.eval()
+    text_prompts = [config.TEXT_DESCRIPTORS[i] for i in range(len(config.CLASS_NAMES))]
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Evaluating"):
+            pixel_values = batch['pixel_values'].to(device)
+            labels = batch['label']
+            text_inputs = processor(text=text_prompts, return_tensors="pt", padding=True).to(device)
+            outputs = model(pixel_values=pixel_values, **text_inputs)
+            logits_per_image = outputs.logits_per_image
+            preds = logits_per_image.argmax(dim=1).cpu()
+            all_preds.append(preds)
+            all_labels.append(labels)
+    return torch.cat(all_preds), torch.cat(all_labels)
+
+def main():
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # --- FIX: Point to the correct test set file ---
+    test_h5_path = os.path.join(config.PROCESSED_DATA_DIR, 'test_frames.h5')
+    # stats_path = os.path.join(config.PROCESSED_DATA_DIR, "norm_stats.json")
+    stats_path = os.path.join(config.PROCESSED_DATA_DIR, "test_norm_stats.json")
+    print(f"Using test data from: {test_h5_path} with stats at {stats_path}")
+    if not os.path.exists(test_h5_path):
+        raise FileNotFoundError(f"Test data not found at {test_h5_path}. Please run preprocess.py first.")
+
+    class_names = config.CLASS_NAMES
+
+    # In this supervised setup, we only evaluate our fine-tuned model.
+    # The "baseline" evaluation is less meaningful here.
+    print("\n--- Running Evaluation with Fine-tuned CLIP on the Test Set ---")
+    try:
+        tuned_model = CLIPModel.from_pretrained(config.FINETUNED_MODEL_PATH)
+        tuned_processor = CLIPProcessor.from_pretrained(config.FINETUNED_MODEL_PATH)
+        test_dataset = dataset.RadarFrameDataset(test_h5_path, stats_path, tuned_processor)
+        test_loader = DataLoader(test_dataset, batch_size=config.EVAL_BATCH_SIZE, shuffle=False)
+        tuned_preds, true_labels = run_zero_shot_eval(tuned_model, tuned_processor, test_loader, device)
+
+        output_path_tuned = os.path.join(config.ARTIFACTS_DIR, "confusion_matrix_finetuned.png")
+        utils.plot_advanced_confusion_matrices(
+            true_labels.tolist(), tuned_preds.tolist(), class_names,
+            output_path_tuned, title_prefix="Fine-tuned CLIP Evaluation"
+        )
+    except OSError:
+        print(f"❌ Fine-tuned model not found at {config.FINETUNED_MODEL_PATH}. Please run finetune_clip.py first.")
+
+if __name__ == '__main__':
+    main()
+```
+I used this our previous working preprocess_work.py code
+```
+# src/preprocess.py
+import os
+import json
+import numpy as np
+import h5py
+from tqdm import tqdm
+from glob import glob
+from scipy.signal import windows
+from scipy.ndimage import median_filter, gaussian_filter
+from sklearn.model_selection import train_test_split
+from . import config
+import matplotlib.pyplot as plt
+import imageio
+
+
+# --- RDM Processing Configuration for REAL (JSON) Data ---
+NUM_CHIRPS = 128
+NUM_SAMPLES = 128
+NUM_RX = 3
+RANGE_FFT_SIZE = NUM_SAMPLES
+DOPPLER_FFT_SIZE = NUM_CHIRPS * 2
+EPS = 1e-6
+range_win = windows.blackmanharris(NUM_SAMPLES)
+doppler_win = windows.blackmanharris(NUM_CHIRPS)
+RANGE_PAD = NUM_SAMPLES
+DOPPLER_PAD = NUM_CHIRPS
+RANGE_FFT_LEN = NUM_SAMPLES * 2
+DOPPLER_FFT_LEN = NUM_CHIRPS * 2
+
+
+# Bin axes for visualization
+doppler_bins = np.arange(-NUM_CHIRPS, NUM_CHIRPS)
+range_bins = np.arange(RANGE_FFT_SIZE)
+
+
+def process_frame_from_json(frame_data, moving_avg_state, moving_avg_alpha=0.6, mti_alpha=1.0):
+    """Applies the advanced RDM processing pipeline to a single raw JSON data frame."""
+    final_rdm = np.zeros((RANGE_FFT_SIZE, DOPPLER_FFT_SIZE), dtype=np.complex64)
+    updated_mavg = moving_avg_state.copy()
+
+    for ant in range(NUM_RX):
+        key = f"RX{ant+1}"
+        raw_list = frame_data.get(key)
+        if raw_list is None: return None, moving_avg_state
+        
+        flat = np.array(raw_list)
+        if flat.size != NUM_CHIRPS * NUM_SAMPLES * 2: return None, moving_avg_state
+
+        reshaped = flat.reshape((NUM_CHIRPS, NUM_SAMPLES, 2))
+        raw = reshaped[...,0] + 1j * reshaped[...,1]
+
+        raw -= raw.mean(axis=1, keepdims=True)
+        fft_rng = np.fft.fft(raw * range_win, axis=1) / NUM_SAMPLES
+        
+        rng_half = fft_rng[:, :RANGE_FFT_SIZE] 
+        
+        fft1d = rng_half.T * doppler_win
+        fft_dopp = np.fft.fft(fft1d, n=DOPPLER_FFT_SIZE, axis=1) / NUM_CHIRPS
+
+        updated_mavg[ant] = fft_dopp * moving_avg_alpha + moving_avg_state[ant] * (1 - moving_avg_alpha)
+        mti_out = fft_dopp - updated_mavg[ant] * mti_alpha
+        
+        dop_shift = np.fft.fftshift(mti_out, axes=1)
+        final_rdm += dop_shift
+
+    return final_rdm, updated_mavg
+
+# def process_synthetic_csv_source(input_path: str):
+#     """Finds and loads pre-calculated RDMs from CSV files."""
+#     all_rdms, all_labels = [], []
+#     for class_name, label_idx in config.CLASS_MAPPING.items():
+#         class_dir = os.path.join(input_path, class_name)
+#         if not os.path.isdir(class_dir): continue
+        
+#         files = sorted(glob(os.path.join(class_dir, "*.csv")))
+#         for fp in tqdm(files, desc=f"Loading Synthetic CSVs ({class_name})"):
+#             rdm = np.transpose(np.loadtxt(fp, delimiter=','), axes=(1, 0))
+
+#             # --- START OF FIX ---
+#             # The synthetic data is missing the crucial fftshift on the Doppler axis.
+#             # We apply it here to match the real-data processing pipeline and ensure
+#             # physical correctness (negative Doppler for 'towards' motion).
+#             # The Doppler dimension is axis 0 (length NUM_CHIRPS).
+#             rdm = np.fft.fftshift(rdm, axes=0)
+#             # --- END OF FIX ---
+
+#             if rdm.shape != (NUM_CHIRPS, NUM_SAMPLES):
+#                 print(f"⚠️  {fp} has unexpected shape {rdm.shape}, skipping")
+#                 continue
+#             else:
+#                 print(f"Loaded {fp} with shape {rdm.shape}")
+#             # The synthetic data is clean and already processed into RDMs.
+#             # We will convert it to a consistent dB scale.
+            
+#             all_rdms.append(rdm)
+#             all_labels.append(label_idx)
+
+#     if not all_rdms: return None, None
+    
+#     # print("Converting synthetic data to dB scale...")
+#     # db_list = [20*np.log10(np.abs(r)+EPS) for r in all_rdms]
+#     # return np.array(db_list), np.array(all_labels)
+#     return np.array(all_rdms), np.array(all_labels)
+
+
+def process_synthetic_csv_source(input_path: str):
+    """Finds and loads pre-calculated RDMs from CSV files."""
+    all_rdms, all_labels = [], []
+    for class_name, label_idx in config.CLASS_MAPPING.items():
+        class_dir = os.path.join(input_path, class_name)
+        if not os.path.isdir(class_dir): continue
+        
+        files = sorted(glob(os.path.join(class_dir, "*.csv")))
+        for fp in tqdm(files, desc=f"Loading Synthetic CSVs ({class_name})"):
+            rdm = np.transpose(np.loadtxt(fp, delimiter=','), axes=(1, 0))
+
+            # Step 1: Center the Doppler spectrum (still required).
+            rdm = np.fft.fftshift(rdm, axes=0)
+            
+            # --- START OF FIX ---
+            # The user observed the RDM is rotated 180 degrees from physical reality.
+            # (Positive Doppler for 'towards', increasing range for 'towards').
+            # We apply a 180-degree rotation to correct both axes simultaneously.
+            rdm = np.rot90(rdm, k=2)
+            # rdm = np.rot90(rdm, k=2) # This already includes the vertical flip
+
+            # --- END OF FIX ---
+
+            if rdm.shape != (NUM_CHIRPS, NUM_SAMPLES):
+                print(f"⚠️  {fp} has unexpected shape {rdm.shape}, skipping")
+                continue
+            
+            all_rdms.append(rdm)
+            all_labels.append(label_idx)
+
+    if not all_rdms: return None, None
+    
+    return np.array(all_rdms), np.array(all_labels)
+
+
+
+def process_frame(frame_data, moving_avg_state, moving_avg_alpha, mti_alpha):
+    """
+    Applies preprocessing: DC removal, windowing, zero-padding, FFT,
+    half-spectrum extract + energy compensation, Doppler FFT,
+    moving-average + MTI filtering, and coherent sum.
+
+    Returns:
+        final_rdm: complex RDM [range_bins, doppler_bins*2]
+        updated_mavg: updated moving-average state per antenna
+    """
+    final_rdm = np.zeros((RANGE_FFT_SIZE, DOPPLER_FFT_SIZE), dtype=np.complex64)
+    updated_mavg = moving_avg_state.copy()
+
+    for ant in range(NUM_RX):
+        key = f"RX{ant+1}"
+        raw_list = frame_data.get(key)
+        if raw_list is None:
+            return None, moving_avg_state
+
+        flat = np.array(raw_list)
+        if flat.size != NUM_CHIRPS * NUM_SAMPLES * 2:
+            return None, moving_avg_state
+
+        # Reconstruct complex IQ
+        reshaped = flat.reshape((NUM_CHIRPS, NUM_SAMPLES, 2))
+        raw = reshaped[...,0] + 1j * reshaped[...,1]
+
+        # DC removal
+        raw -= raw.mean(axis=1, keepdims=True)
+        # Range window + zero-pad
+        win_rng = raw * range_win
+        zp_rng = np.pad(win_rng, ((0,0),(0,RANGE_PAD)), mode='constant')
+        # Range FFT + energy compensation
+        fft_rng = np.fft.fft(zp_rng, axis=1) / NUM_SAMPLES
+        rng_half = 2 * fft_rng[:, :RANGE_FFT_SIZE]
+
+        # Doppler prep: transpose, window, pad
+        fft1d = rng_half.T * doppler_win
+        # fft1d = rng_half * doppler_win
+        zp_dopp = np.pad(fft1d, ((0,0),(0,DOPPLER_PAD)), mode='constant')
+        # Doppler FFT
+        fft_dopp = np.fft.fft(zp_dopp, axis=1) / NUM_CHIRPS
+
+        # Moving-average update and MTI subtraction
+        updated_mavg[ant] = fft_dopp * moving_avg_alpha + moving_avg_state[ant] * (1 - moving_avg_alpha)
+        mti_out = fft_dopp - updated_mavg[ant] * mti_alpha
+
+        # Center zero-Doppler
+        dop_shift = np.fft.fftshift(mti_out, axes=1)
+
+        # Sum antennas
+        final_rdm += dop_shift
+
+    return final_rdm, updated_mavg
+
+
+
+# def create_rdm_gif(
+#     rdm_list, output_path, fps, cmap,
+#     median_size=0, gauss_sigma=0.0, morph_size=0
+# ):
+#     """
+#     Converts complex RDM list to dB, applies spatial noise-reduction filters,
+#     and writes GIF with specified colormap.
+
+#     - median_size: kernel for median filter (0 = off)
+#     - gauss_sigma: sigma for Gaussian smoothing (0 = off)
+#     - morph_size: size for morphological opening (0 = off)
+#     """
+#     # Convert to dB
+#     db_list = [20*np.log10(np.abs(r)+EPS) for r in rdm_list]
+
+#     # Optional median smoothing
+#     if median_size and median_size > 1:
+#         db_list = [median_filter(f, size=(median_size, median_size)) for f in db_list]
+
+#     # if mean_size and mean_size > 1:
+#     #     db_list = [mean_size(f, size=(mean_size, mean_size)) for f in db_list]
+
+
+#     # Optional Gaussian smoothing
+#     if gauss_sigma and gauss_sigma > 0:
+#         from scipy.ndimage import gaussian_filter
+#         db_list = [gaussian_filter(f, sigma=gauss_sigma) for f in db_list]
+
+#     # Optional morphological opening to remove small speckle
+#     if morph_size and morph_size > 1:
+#         from scipy.ndimage import grey_opening
+#         db_list = [grey_opening(f, size=(morph_size, morph_size)) for f in db_list]
+
+
+#     # Determine display range from raw (pre-filter) statistics
+#     all_vals = np.concatenate([f.flatten() for f in db_list])
+#     vmin = np.percentile(all_vals, 30)
+#     vmax = np.percentile(all_vals, 99.9)
+#     print(f"{cmap} scale: {vmin:.1f}–{vmax:.1f} dB")
+
+#     # Generate frames
+#     images = []
+#     fig, ax = plt.subplots(figsize=(6,6))
+#     for i, frame in enumerate(tqdm(db_list, desc=f"GIF frames ({cmap})")):
+#         ax.clear()
+#         ax.imshow(
+#             frame,
+#             origin='lower',
+#             aspect='auto',
+#             vmin=vmin,
+#             vmax=vmax,
+#             cmap=cmap,
+#             extent=[doppler_bins[0], doppler_bins[-1], range_bins[0], range_bins[-1]]
+#         )
+#         ax.set_xlabel("Doppler Bin (neg= towards)")
+#         ax.set_ylabel("Range Bin")
+#         ax.set_title(f"RDM Frame {i+1}/{len(db_list)}")
+#         fig.canvas.draw()
+#         img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+#         img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+#         images.append(img)
+#     plt.close(fig)
+
+#     # Save GIF
+#     imageio.mimsave(output_path, images, fps=fps, loop=0)
+#     print(f"✅ Saved {output_path}")
+
+
+
+def process_real_json_source(input_path: str):
+    """Finds and processes raw radar data from JSON files."""
+    files_to_process, labels_to_process = [], []
+    for class_name, label_idx in config.CLASS_MAPPING.items():
+        class_dir = os.path.join(input_path, class_name)
+        if not os.path.isdir(class_dir): continue
+        files = sorted(glob(os.path.join(class_dir, "*.json")))
+        files_to_process.extend(files)
+        labels_to_process.extend([label_idx] * len(files))
+    
+    if not files_to_process: return None, None
+
+    mv_state = np.zeros((NUM_RX, RANGE_FFT_SIZE, DOPPLER_FFT_SIZE), dtype=complex)
+    complex_rdms, valid_labels = [], []
+    for i, fp in enumerate(tqdm(files_to_process, desc="Processing Real JSON")):
+        try:
+            with open(fp, 'r') as f:
+                frame = json.load(f)
+            # rdm, mv_state = process_frame_from_json(frame, mv_state)
+            rdm, mv_state = process_frame(frame, mv_state, moving_avg_alpha=0.6, mti_alpha=1.0)
+            if rdm is not None:
+                complex_rdms.append(rdm)
+                valid_labels.append(labels_to_process[i])
+        except Exception as e:
+            print(f"Skipping {fp}: {e}")
+
+    print("Applying filters to real data...")
+    db_list = [20*np.log10(np.abs(r)+EPS) for r in complex_rdms]
+    db_list = [median_filter(f, size=3) for f in db_list]
+    db_list = [gaussian_filter(f, sigma=1) for f in db_list]
+
+    all_vals = np.concatenate([f.flatten() for f in db_list])
+    vmin = np.percentile(all_vals, 30)
+    vmax = np.percentile(all_vals, 99.9)
+    
+
+    #TODO: REMOVE LATER
+    # Generate frames
+    # images = []
+    # output_path="test.gif"
+    # fig, ax = plt.subplots(figsize=(6,6))
+    # for i, frame in enumerate(tqdm(db_list, desc=f"GIF frames ")):
+    #     ax.clear()
+    #     ax.imshow(
+    #         frame,
+    #         origin='lower',
+    #         aspect='auto',
+    #         vmin=vmin,
+    #         vmax=vmax,
+    #         cmap='viridis',
+    #         extent=[doppler_bins[0], doppler_bins[-1], range_bins[0], range_bins[-1]]
+    #     )
+    #     ax.set_xlabel("Doppler Bin (neg= towards)")
+    #     ax.set_ylabel("Range Bin")
+    #     ax.set_title(f"RDM Frame {i+1}/{len(db_list)}")
+    #     fig.canvas.draw()
+    #     img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    #     img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    #     images.append(img)
+    # plt.close(fig)
+
+    # # Save GIF
+    # fps = 10
+    # imageio.mimsave(output_path, images, fps=fps, loop=0)
+    # print(f"✅ Saved {output_path}")
+
+
+    # --- START OF FIX ---
+    # The raw RDM has range_bin 0 (closest) at the top (row 0).
+    # To match standard plotting conventions (y-axis increases upwards),
+    # we must vertically flip each RDM. This makes the data physically intuitive.
+    print("Applying vertical flip to real data for correct range orientation...")
+    complex_rdms = [np.flipud(r) for r in complex_rdms]
+    # --- END OF FIX ---
+
+    print("Applying filters to real data...")
+    db_list = [20*np.log10(np.abs(r)+EPS) for r in complex_rdms]
+    db_list = [median_filter(f, size=3) for f in db_list]
+    db_list = [gaussian_filter(f, sigma=1) for f in db_list]
+
+    all_vals = np.concatenate([f.flatten() for f in db_list])
+    vmin = np.percentile(all_vals, 30)
+    vmax = np.percentile(all_vals, 99.9)
+    
+    return np.array(db_list), np.array(valid_labels), vmin, vmax
+    # return np.array(db_list), np.array(valid_labels), vmin, vmax
+
+def main():
+    os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
+
+    # --- Process Synthetic Data (from CSVs) for Training and Validation ---
+    print(f"Processing synthetic data from CSV files {config.SYNTHETIC_DATA_PATH}...")
+
+    synth_frames, synth_labels = process_synthetic_csv_source(config.SYNTHETIC_DATA_PATH)
+    if synth_frames is None: 
+        print("❌ FATAL ERROR: No synthetic CSV data found. Check SYNTHETIC_DATA_PATH in config.")
+        return
+
+    print("Splitting synthetic data into train and validation sets...")
+    X_train, X_val, y_train, y_val = train_test_split(
+        synth_frames, synth_labels, test_size=0.2, stratify=synth_labels, random_state=42)
+
+    # --- Process Real Data (from JSONs) for Testing ---
+    real_frames, real_labels, real_vmin, real_vmax = process_real_json_source(config.REAL_DATA_PATH)
+    if real_frames is None: 
+        print("❌ FATAL ERROR: No real JSON data found. Check REAL_DATA_PATH in config.")
+        return
+
+    X_test, y_test = real_frames, real_labels
+    
+    # --- Save Normalization Stats (calculated from SYNTHETIC TRAIN set only) ---
+    min_val = np.min(X_train)
+    max_val = np.max(X_train)
+    stats = {'min': float(min_val), 'max': float(max_val)}
+    stats_path = os.path.join(config.PROCESSED_DATA_DIR, "norm_stats.json")
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=4)
+    print(f"\nNormalization stats saved to {stats_path}")
+
+    # --- Save test set stats ---
+    # all_vals = np.concatenate([f.flatten() for f in db_list])
+    # vmin = np.percentile(all_vals, 30)
+    # vmax = np.percentile(all_vals, 99.9)    
+    stats = {'min': float(real_vmin), 'max': float(real_vmax)}
+    stats_path = os.path.join(config.PROCESSED_DATA_DIR, "test_norm_stats.json")
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=4)
+    print(f"\nTest set normalization stats saved to {stats_path}")
+
+    # --- Save all datasets to HDF5 files ---
+    for name, (X, y) in zip(['train', 'val', 'test'], [(X_train, y_train), (X_val, y_val), (X_test, y_test)]):
+        out_path = os.path.join(config.PROCESSED_DATA_DIR, f"{name}_frames.h5")
+        with h5py.File(out_path, 'w') as hf:
+            hf.create_dataset('data', data=X, compression="gzip")
+            hf.create_dataset('labels', data=y)
+        print(f"Saved {len(y)} frames to {out_path}")
+
+if __name__ == '__main__':
+    main()
+```
+And here is attached the terminal
+```
+huy@ece-nebula09:~/seb_paper/clip_sim2real/zero_shot_sim2real_binary_occupancy$ python3 -m src_gt.preprocess_work
+Processing synthetic data from CSV files data/synthetic...
+Loading Synthetic CSVs (empty_room): 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 101/101 [00:00<00:00, 301.12it/s]
+Loading Synthetic CSVs (1_person): 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 101/101 [00:00<00:00, 285.73it/s]
+Splitting synthetic data into train and validation sets...
+Processing Real JSON:  71%|██████████████████████████████████████████████████████████████████████████████████████████████████████▌                                          | 447/632 [00:14<00:05, 30.89it/s]Skipping data/real/empty_room/Empty_2024-03-05 12-14-07.819618.json: Expecting value: line 1 column 1 (char 0)
+Processing Real JSON: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 632/632 [00:20<00:00, 31.00it/s]
+Applying filters to real data...
+Applying vertical flip to real data for correct range orientation...
+Applying filters to real data...
+
+Normalization stats saved to processed_data_s2r_csv_t2/norm_stats.json
+
+Test set normalization stats saved to processed_data_s2r_csv_t2/test_norm_stats.json
+Saved 161 frames to processed_data_s2r_csv_t2/train_frames.h5
+Saved 41 frames to processed_data_s2r_csv_t2/val_frames.h5
+Saved 631 frames to processed_data_s2r_csv_t2/test_frames.h5
+huy@ece-nebula09:~/seb_paper/clip_sim2real/zero_shot_sim2real_binary_occupancy$ python3 -m src.finetune_clip
+Using device: cuda
+Loading CLIP model: openai/clip-vit-base-patch32
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+Total training samples: 161, Validation samples: 41
+Starting CLIP fine-tuning for 50 epochs...
+Epoch 1/50: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:01<00:00,  4.61it/s]
+Epoch 1/50 [Validation]: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  7.10it/s]
+Epoch 1 | Train Loss: 0.3415 | Val Loss: 0.0002
+Validation loss improved. Saved new best model.
+Epoch 2/50: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.21it/s]
+Epoch 2/50 [Validation]: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.91it/s]
+Epoch 2 | Train Loss: 0.0061 | Val Loss: 0.0024
+INFO: No improvement in validation loss for 1 epoch(s).
+Epoch 3/50: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.08it/s]
+Epoch 3/50 [Validation]: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.85it/s]
+Epoch 3 | Train Loss: 0.0005 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 4/50: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.31it/s]
+Epoch 4/50 [Validation]: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.64it/s]
+Epoch 4 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 5/50: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.31it/s]
+Epoch 5/50 [Validation]: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  7.38it/s]
+Epoch 5 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 6/50: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.27it/s]
+Epoch 6/50 [Validation]: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.54it/s]
+Epoch 6 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 7/50: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.40it/s]
+Epoch 7/50 [Validation]: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.63it/s]
+Epoch 7 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 8/50: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.38it/s]
+Epoch 8/50 [Validation]: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.59it/s]
+Epoch 8 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 9/50: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.41it/s]
+Epoch 9/50 [Validation]: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.97it/s]
+Epoch 9 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 10/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.20it/s]
+Epoch 10/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  7.00it/s]
+Epoch 10 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 11/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.29it/s]
+Epoch 11/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.76it/s]
+Epoch 11 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 12/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.28it/s]
+Epoch 12/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  7.29it/s]
+Epoch 12 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 13/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.31it/s]
+Epoch 13/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.83it/s]
+Epoch 13 | Train Loss: 0.0000 | Val Loss: 0.0000
+INFO: No improvement in validation loss for 1 epoch(s).
+Epoch 14/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.26it/s]
+Epoch 14/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.95it/s]
+Epoch 14 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 15/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.31it/s]
+Epoch 15/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  7.03it/s]
+Epoch 15 | Train Loss: 0.0000 | Val Loss: 0.0000
+INFO: No improvement in validation loss for 1 epoch(s).
+Epoch 16/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.25it/s]
+Epoch 16/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.05it/s]
+Epoch 16 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 17/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.11it/s]
+Epoch 17/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.23it/s]
+...
+ Epoch 48 | Train Loss: 0.0000 | Val Loss: 0.0000
+INFO: No improvement in validation loss for 1 epoch(s).
+Epoch 49/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.03it/s]
+Epoch 49/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.37it/s]
+Epoch 49 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+Epoch 50/50: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:00<00:00,  6.25it/s]
+Epoch 50/50 [Validation]: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00,  6.79it/s]
+Epoch 50 | Train Loss: 0.0000 | Val Loss: 0.0000
+Validation loss improved. Saved new best model.
+✅ Fine-tuned CLIP model saved to artifacts_binary_s2r/clip_finetuned_sim2real
+huy@ece-nebula09:~/seb_paper/clip_sim2real/zero_shot_sim2real_binary_occupancy$ python3 -m src.evaluate
+Using test data from: processed_data_binary_s2r/test_frames.h5 with stats at processed_data_binary_s2r/test_norm_stats.json
+
+--- Running Evaluation with Fine-tuned CLIP on the Test Set ---
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+Evaluating: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 10/10 [00:15<00:00,  1.54s/it] 
+```
+
+I think stick to this as this is our core mainly research for paper, think deeply of everything and write down analytic and everything for top conference paper submission, I think the novelty is that we just train on simulation but then evaluate on real case with CLIP model, language, prompt and embedding
